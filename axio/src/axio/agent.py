@@ -139,8 +139,7 @@ class Agent:
         return await self.run_stream(user_message, context).get_final_text()
 
     async def dispatch_tools(self, blocks: list[ToolUseBlock], iteration: int) -> list[ToolResultBlock]:
-        tool_names = [b.name for b in blocks]
-        logger.info("Dispatching %d tool(s): %s", len(blocks), tool_names)
+        logger.info("Dispatching %d tool(s): %r", len(blocks), blocks)
 
         async def _run_one(block: ToolUseBlock) -> ToolResultBlock:
             tool = self._find_tool(block.name)
@@ -173,8 +172,7 @@ class Agent:
         output_queue: asyncio.Queue[ToolOutputDelta | None],
     ) -> list[ToolResultBlock]:
         """Like dispatch_tools but pushes ToolOutputDelta events for streaming tools."""
-        tool_names = [b.name for b in blocks]
-        logger.info("Dispatching %d tool(s) with streaming: %s", len(blocks), tool_names)
+        logger.info("Dispatching %d tool(s) with streaming: %r", len(blocks), blocks)
 
         async def _run_one(block: ToolUseBlock) -> ToolResultBlock:
             tool = self._find_tool(block.name)
