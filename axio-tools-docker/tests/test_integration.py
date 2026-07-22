@@ -94,14 +94,14 @@ async def test_write_file_mode(sandbox: DockerSandbox) -> None:
 async def test_read_file_line_range(sandbox: DockerSandbox) -> None:
     await sandbox.write_file("/workspace/lines.txt", "a\nb\nc\nd\ne\n")
     tool = next(t for t in sandbox.tools if t.name == "read_file")
-    result = await tool(filename="lines.txt", start_line=2, end_line=4)
+    result = await tool(path="lines.txt", start_line=2, end_line=4)
     assert result.strip() == "b\nc\nd"
 
 
 async def test_read_file_line_numbers(sandbox: DockerSandbox) -> None:
     await sandbox.write_file("/workspace/numbered.txt", "foo\nbar\n")
     tool = next(t for t in sandbox.tools if t.name == "read_file")
-    result = await tool(filename="numbered.txt", line_numbers=True)
+    result = await tool(path="numbered.txt", line_numbers=True)
     assert "1\tfoo" in result
     assert "2\tbar" in result
 
@@ -109,8 +109,15 @@ async def test_read_file_line_numbers(sandbox: DockerSandbox) -> None:
 async def test_read_file_truncation(sandbox: DockerSandbox) -> None:
     await sandbox.write_file("/workspace/big.txt", "x" * 100)
     tool = next(t for t in sandbox.tools if t.name == "read_file")
-    result = await tool(filename="big.txt", max_chars=10)
+    result = await tool(path="big.txt", max_chars=10)
     assert "truncated" in result
+
+
+async def test_read_file_missing_raises_file_not_found(sandbox: DockerSandbox) -> None:
+    # A 404 from the container archive endpoint must surface as a clear
+    # FileNotFoundError, not a raw Docker 404.
+    with pytest.raises(FileNotFoundError, match="No such file or directory"):
+        await sandbox.read_file_bytes("/workspace/nope.txt")
 
 
 async def test_list_files(sandbox: DockerSandbox) -> None:
@@ -120,7 +127,7 @@ async def test_list_files(sandbox: DockerSandbox) -> None:
     await sandbox.exec("mkdir -p /workspace/listing/subdir")
 
     tool = next(t for t in sandbox.tools if t.name == "list_files")
-    result = await tool(directory="/workspace/listing")
+    result = await tool(path="/workspace/listing")
 
     assert "a.py" in result
     assert "b.txt" in result
@@ -131,7 +138,7 @@ async def test_list_files(sandbox: DockerSandbox) -> None:
 async def test_patch_file(sandbox: DockerSandbox) -> None:
     await sandbox.write_file("/workspace/patch_me.txt", "line1\nline2\nline3\n")
     tool = next(t for t in sandbox.tools if t.name == "patch_file")
-    await tool(file_path="/workspace/patch_me.txt", from_line=2, to_line=2, content="REPLACED")
+    await tool(path="/workspace/patch_me.txt", from_line=2, to_line=2, content="REPLACED")
     raw = await sandbox.read_file_bytes("/workspace/patch_me.txt")
     assert raw == b"line1\nREPLACED\nline3\n"
 
@@ -140,7 +147,7 @@ async def test_patch_file_insert(sandbox: DockerSandbox) -> None:
     """to_line = from_line - 1 inserts without deleting."""
     await sandbox.write_file("/workspace/insert_me.txt", "line1\nline3\n")
     tool = next(t for t in sandbox.tools if t.name == "patch_file")
-    await tool(file_path="/workspace/insert_me.txt", from_line=2, to_line=1, content="line2")
+    await tool(path="/workspace/insert_me.txt", from_line=2, to_line=1, content="line2")
     raw = await sandbox.read_file_bytes("/workspace/insert_me.txt")
     assert raw == b"line1\nline2\nline3\n"
 
@@ -154,7 +161,7 @@ async def test_patch_file_from_line_zero_rejected(sandbox: DockerSandbox) -> Non
     await sandbox.write_file("/workspace/v.txt", "a\nb\nc\n")
     tool = next(t for t in sandbox.tools if t.name == "patch_file")
     with pytest.raises(Exception, match="from_line=0"):
-        await tool(file_path="/workspace/v.txt", from_line=0, to_line=1, content="x")
+        await tool(path="/workspace/v.txt", from_line=0, to_line=1, content="x")
     assert await sandbox.read_file_bytes("/workspace/v.txt") == b"a\nb\nc\n"
 
 
@@ -162,7 +169,7 @@ async def test_patch_file_negative_from_line_rejected(sandbox: DockerSandbox) ->
     await sandbox.write_file("/workspace/v.txt", "a\nb\nc\n")
     tool = next(t for t in sandbox.tools if t.name == "patch_file")
     with pytest.raises(Exception, match="from_line=-1"):
-        await tool(file_path="/workspace/v.txt", from_line=-1, to_line=1, content="x")
+        await tool(path="/workspace/v.txt", from_line=-1, to_line=1, content="x")
     assert await sandbox.read_file_bytes("/workspace/v.txt") == b"a\nb\nc\n"
 
 
@@ -170,7 +177,7 @@ async def test_patch_file_from_line_beyond_end_rejected(sandbox: DockerSandbox) 
     await sandbox.write_file("/workspace/v.txt", "a\nb\nc\n")
     tool = next(t for t in sandbox.tools if t.name == "patch_file")
     with pytest.raises(Exception, match="from_line=5"):
-        await tool(file_path="/workspace/v.txt", from_line=5, to_line=5, content="x")
+        await tool(path="/workspace/v.txt", from_line=5, to_line=5, content="x")
     assert await sandbox.read_file_bytes("/workspace/v.txt") == b"a\nb\nc\n"
 
 
@@ -178,7 +185,7 @@ async def test_patch_file_to_line_beyond_end_rejected(sandbox: DockerSandbox) ->
     await sandbox.write_file("/workspace/v.txt", "a\nb\nc\n")
     tool = next(t for t in sandbox.tools if t.name == "patch_file")
     with pytest.raises(Exception, match="to_line=4"):
-        await tool(file_path="/workspace/v.txt", from_line=2, to_line=4, content="x")
+        await tool(path="/workspace/v.txt", from_line=2, to_line=4, content="x")
     assert await sandbox.read_file_bytes("/workspace/v.txt") == b"a\nb\nc\n"
 
 
@@ -187,7 +194,7 @@ async def test_patch_file_gap_range_rejected(sandbox: DockerSandbox) -> None:
     await sandbox.write_file("/workspace/v.txt", "a\nb\nc\nd\ne\n")
     tool = next(t for t in sandbox.tools if t.name == "patch_file")
     with pytest.raises(Exception, match="to_line=2"):
-        await tool(file_path="/workspace/v.txt", from_line=4, to_line=2, content="x")
+        await tool(path="/workspace/v.txt", from_line=4, to_line=2, content="x")
     assert await sandbox.read_file_bytes("/workspace/v.txt") == b"a\nb\nc\nd\ne\n"
 
 
@@ -200,9 +207,9 @@ async def test_patch_file_second_patch_rejected(sandbox: DockerSandbox) -> None:
     """Second patch to the same file without re-reading must raise RuntimeError."""
     await sandbox.write_file("/workspace/dp.txt", "a\nb\nc\n")
     tool = next(t for t in sandbox.tools if t.name == "patch_file")
-    await tool(file_path="/workspace/dp.txt", from_line=1, to_line=1, content="A\n")
+    await tool(path="/workspace/dp.txt", from_line=1, to_line=1, content="A\n")
     with pytest.raises(Exception, match="already patched"):
-        await tool(file_path="/workspace/dp.txt", from_line=2, to_line=2, content="B\n")
+        await tool(path="/workspace/dp.txt", from_line=2, to_line=2, content="B\n")
     raw = await sandbox.read_file_bytes("/workspace/dp.txt")
     assert raw == b"A\nb\nc\n"
 
@@ -212,9 +219,9 @@ async def test_patch_file_read_clears_double_patch_guard(sandbox: DockerSandbox)
     await sandbox.write_file("/workspace/rg.txt", "a\nb\nc\n")
     patch_tool = next(t for t in sandbox.tools if t.name == "patch_file")
     read_tool = next(t for t in sandbox.tools if t.name == "read_file")
-    await patch_tool(file_path="/workspace/rg.txt", from_line=1, to_line=1, content="A\n")
-    await read_tool(filename="/workspace/rg.txt", line_numbers=True)
-    await patch_tool(file_path="/workspace/rg.txt", from_line=2, to_line=2, content="B\n")
+    await patch_tool(path="/workspace/rg.txt", from_line=1, to_line=1, content="A\n")
+    await read_tool(path="/workspace/rg.txt", line_numbers=True)
+    await patch_tool(path="/workspace/rg.txt", from_line=2, to_line=2, content="B\n")
     raw = await sandbox.read_file_bytes("/workspace/rg.txt")
     assert raw == b"A\nB\nc\n"
 
@@ -228,7 +235,7 @@ async def test_patch_file_null_bytes_in_preserved_lines_survive(sandbox: DockerS
     """Null bytes in lines not being replaced must not be stripped."""
     await sandbox.write_file("/workspace/null.txt", "line1\nline2\x00null\nline3\n")
     tool = next(t for t in sandbox.tools if t.name == "patch_file")
-    await tool(file_path="/workspace/null.txt", from_line=1, to_line=1, content="replaced\n")
+    await tool(path="/workspace/null.txt", from_line=1, to_line=1, content="replaced\n")
     raw = await sandbox.read_file_bytes("/workspace/null.txt")
     assert b"line2\x00null" in raw, "null byte in preserved line was stripped"
     assert raw.startswith(b"replaced\n")
@@ -240,7 +247,7 @@ async def test_patch_file_binary_file_raises_before_write(sandbox: DockerSandbox
     tool = next(t for t in sandbox.tools if t.name == "patch_file")
     original = await sandbox.read_file_bytes("/workspace/bin.bin")
     with pytest.raises(Exception, match="codec can't decode"):
-        await tool(file_path="/workspace/bin.bin", from_line=1, to_line=1, content="hello\n")
+        await tool(path="/workspace/bin.bin", from_line=1, to_line=1, content="hello\n")
     assert await sandbox.read_file_bytes("/workspace/bin.bin") == original
 
 

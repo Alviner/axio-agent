@@ -72,18 +72,18 @@ async def shell(command: str, timeout: float = 5, cwd: str = ".", stdin: str | N
     return await sandbox.exec(cmd, timeout=timeout, stdin=stdin)
 
 
-async def write_file(file_path: str, content: str, mode: int = 0o644) -> str:
+async def write_file(path: str, content: str, mode: int = 0o644) -> str:
     """Create or overwrite a file with the given content. Parent directories
     are created automatically. Use this for new files or full rewrites.
     For partial edits prefer patch_file instead."""
     sandbox: DockerSandbox = CONTEXT.get()
-    path = _resolve_path(sandbox.workdir, file_path)
-    return await sandbox.write_file(path, content, mode=mode)
+    resolved = _resolve_path(sandbox.workdir, path)
+    return await sandbox.write_file(resolved, content, mode=mode)
 
 
 async def read_file(
-    filename: str,
-    max_chars: int = 32768,
+    path: str,
+    max_chars: int = 524288,  # ~128k tokens at ~4 chars/token
     binary_as_hex: bool = True,
     start_line: int | None = None,
     end_line: int | None = None,
@@ -96,9 +96,9 @@ async def read_file(
     are truncated to max_chars. Always read the file before editing it with
     write_file or patch_file."""
     sandbox: DockerSandbox = CONTEXT.get()
-    path = _resolve_path(sandbox.workdir, filename)
-    sandbox._patched_files.discard(path)
-    raw = await sandbox.read_file_bytes(path)
+    resolved = _resolve_path(sandbox.workdir, path)
+    sandbox._patched_files.discard(resolved)
+    raw = await sandbox.read_file_bytes(resolved)
     try:
         text = raw.decode()
     except UnicodeDecodeError:
@@ -118,14 +118,14 @@ async def read_file(
     return result
 
 
-async def list_files(directory: str = ".") -> str:
+async def list_files(path: str = ".") -> str:
     """List files and directories. Shows permissions, size, modification time,
     and name for each entry. Directories are listed first and marked with
     a trailing slash. Use this to explore the project structure before
     reading or editing files."""
     sandbox: DockerSandbox = CONTEXT.get()
-    path = _resolve_path(sandbox.workdir, directory)
-    tar = await sandbox.get_archive(path)
+    resolved = _resolve_path(sandbox.workdir, path)
+    tar = await sandbox.get_archive(resolved)
 
     members = tar.getmembers()
     if not members:
@@ -175,7 +175,7 @@ async def run_python(code: str, cwd: str = ".", timeout: float = 5, stdin: str |
     return await sandbox.exec(cmd, timeout=timeout, stdin=stdin)
 
 
-async def patch_file(file_path: str, from_line: int, to_line: int, content: str, mode: int = 0o644) -> str:
+async def patch_file(path: str, from_line: int, to_line: int, content: str, mode: int = 0o644) -> str:
     """Replace a range of lines in an existing file. Lines are 1-indexed:
     from_line and to_line are both inclusive (from_line=2, to_line=4 replaces
     lines 2, 3, 4). To insert without deleting, set to_line = from_line - 1.
@@ -185,13 +185,13 @@ async def patch_file(file_path: str, from_line: int, to_line: int, content: str,
     Use this for surgical edits instead of rewriting the whole file with
     write_file."""
     sandbox: DockerSandbox = CONTEXT.get()
-    path = _resolve_path(sandbox.workdir, file_path)
-    if path in sandbox._patched_files:
+    resolved = _resolve_path(sandbox.workdir, path)
+    if resolved in sandbox._patched_files:
         raise RuntimeError(
-            f"{file_path!r} was already patched since the last read. "
+            f"{path!r} was already patched since the last read. "
             "Re-read the file with line_numbers=True to get updated line numbers before patching again."
         )
-    raw = await sandbox.read_file_bytes(path)
+    raw = await sandbox.read_file_bytes(resolved)
     lines = raw.decode().splitlines(keepends=True)
     n = len(lines)
     if not (1 <= from_line <= n + 1):
@@ -203,9 +203,9 @@ async def patch_file(file_path: str, from_line: int, to_line: int, content: str,
         content_lines[-1] += "\n"
     new_lines = lines[: from_line - 1] + content_lines + lines[to_line:]
     result = "".join(new_lines)
-    await sandbox.write_file(path, result, mode=mode)
-    sandbox._patched_files.add(path)
-    return f"{len(result)} bytes written to {path}"
+    await sandbox.write_file(resolved, result, mode=mode)
+    sandbox._patched_files.add(resolved)
+    return f"{len(result)} bytes written to {resolved}"
 
 
 # ---------------------------------------------------------------------------
@@ -542,7 +542,12 @@ class DockerSandbox:
     async def get_archive(self, path: str) -> tarfile.TarFile:
         """Fetch a path from the container as a TarFile object."""
         assert self._container is not None
-        return cast(tarfile.TarFile, await self._container.get_archive(path=path))
+        try:
+            return cast(tarfile.TarFile, await self._container.get_archive(path=path))
+        except aiodocker.exceptions.DockerError as exc:
+            if exc.status == 404:
+                raise FileNotFoundError(f"No such file or directory: {path!r}") from exc
+            raise
 
     async def read_file_bytes(self, path: str) -> bytes:
         """Read a file from inside the container and return raw bytes."""
