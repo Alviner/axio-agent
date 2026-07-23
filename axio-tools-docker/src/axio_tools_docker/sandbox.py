@@ -97,7 +97,7 @@ async def read_file(
     write_file or patch_file."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
-    sandbox._patched_files.discard(resolved)
+    sandbox.patched_files.discard(resolved)
     raw = await sandbox.read_file_bytes(resolved)
     try:
         text = raw.decode()
@@ -186,7 +186,7 @@ async def patch_file(path: str, from_line: int, to_line: int, content: str, mode
     write_file."""
     sandbox: DockerSandbox = CONTEXT.get()
     resolved = _resolve_path(sandbox.workdir, path)
-    if resolved in sandbox._patched_files:
+    if resolved in sandbox.patched_files:
         raise RuntimeError(
             f"{path!r} was already patched since the last read. "
             "Re-read the file with line_numbers=True to get updated line numbers before patching again."
@@ -204,7 +204,7 @@ async def patch_file(path: str, from_line: int, to_line: int, content: str, mode
     new_lines = lines[: from_line - 1] + content_lines + lines[to_line:]
     result = "".join(new_lines)
     await sandbox.write_file(resolved, result, mode=mode)
-    sandbox._patched_files.add(resolved)
+    sandbox.patched_files.add(resolved)
     return f"{len(result)} bytes written to {resolved}"
 
 
@@ -317,39 +317,38 @@ class DockerSandbox:
         self.privileged = privileged
         self.ulimits: dict[str, int | tuple[int, int]] = ulimits or {}
         self.tmpfs: dict[str, str] = tmpfs or {}
-        self._patched_files: set[str] = set()
+        self.patched_files: set[str] = set()
         self.ports: dict[int, int] = ports or {}
         self.platform = platform
         self.extra_hosts: dict[str, str] = extra_hosts or {}
         self.devices: list[str] = devices or []
         self.dns: list[str] = dns or []
-        self._client: aiodocker.Docker | None = None
-        self._container: aiodocker.containers.DockerContainer | None = None
-        self._attached: bool = False  # True when we reused an existing container
-        self._tools: list[Tool[Any]] | None = None
+        self.client: aiodocker.Docker | None = None
+        self.container: aiodocker.containers.DockerContainer | None = None
+        self.attached: bool = False  # True when we reused an existing container
 
     async def __aenter__(self) -> DockerSandbox:
-        self._client = aiodocker.Docker(url=self.url)
+        self.client = aiodocker.Docker(url=self.url)
         try:
-            await self._client.system.info()
+            await self.client.system.info()
         except Exception as exc:
-            await self._client.close()
-            self._client = None
+            await self.client.close()
+            self.client = None
             raise RuntimeError(f"Docker daemon not available at {self.url!r}: {exc}") from exc
 
         if self.name:
             try:
-                self._container = await self._client.containers.get(self.name)
-                info = await self._container.show()
+                self.container = await self.client.containers.get(self.name)
+                info = await self.container.show()
                 if not info.get("State", {}).get("Running", False):
-                    await self._container.start()
-                self._attached = True
+                    await self.container.start()
+                self.attached = True
                 logger.info("Attached to existing container (name=%s)", self.name)
             except aiodocker.exceptions.DockerError:
-                self._attached = False
+                self.attached = False
 
-        if not self._attached:
-            await self._ensure_image()
+        if not self.attached:
+            await self.ensure_image()
             binds = [f"{host}:{container}" for container, host in self.volumes.items()]
             binds += [f"{vol}:{path}" for path, vol in self.named_volumes.items()]
             host_config: dict[str, Any] = {
@@ -410,70 +409,78 @@ class DockerSandbox:
             create_kwargs: dict[str, Any] = {"config": config}
             if self.name:
                 create_kwargs["name"] = self.name
-            self._container = await self._client.containers.create(**create_kwargs)
-            await self._container.start()
+            self.container = await self.client.containers.create(**create_kwargs)
+            await self.container.start()
             logger.info("Started sandbox container (image=%s)", self.image)
 
-        self._tools = [
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        was_attached = self.attached
+        if self.container is not None:
+            if self.remove and not was_attached:
+                with contextlib.suppress(Exception):
+                    await self.container.delete(force=True)
+                logger.info("Removed sandbox container")
+            else:
+                logger.info("Kept sandbox container (attached=%r, remove=%r)", was_attached, self.remove)
+            self.container = None
+            self.attached = False
+        if self.client is not None:
+            if self.named_volumes and self.volumes_remove and not was_attached:
+                for vol_name in self.named_volumes.values():
+                    with contextlib.suppress(Exception):
+                        vol = await self.client.volumes.get(vol_name)
+                        await vol.delete()
+                logger.info("Removed %d named volume(s)", len(self.named_volumes))
+            await self.client.close()
+            self.client = None
+
+    @property
+    def tools(self) -> tuple[Tool[Any], ...]:
+        """The axio Tool instances for this sandbox, built fresh (bound to ``self``,
+        so a fork's tools bind to the fork). Only valid inside ``async with``."""
+        if self.container is None:
+            raise RuntimeError("DockerSandbox must be used as an async context manager")
+        return (
             Tool(name="shell", handler=shell, context=self),
             Tool(name="write_file", handler=write_file, context=self),
             Tool(name="read_file", handler=read_file, context=self),
             Tool(name="list_files", handler=list_files, context=self),
             Tool(name="run_python", handler=run_python, context=self),
             Tool(name="patch_file", handler=patch_file, context=self),
-        ]
-        return self
-
-    async def __aexit__(self, *exc: object) -> None:
-        was_attached = self._attached
-        if self._container is not None:
-            if self.remove and not was_attached:
-                with contextlib.suppress(Exception):
-                    await self._container.delete(force=True)
-                logger.info("Removed sandbox container")
-            else:
-                logger.info("Kept sandbox container (attached=%r, remove=%r)", was_attached, self.remove)
-            self._container = None
-            self._attached = False
-        if self._client is not None:
-            if self.named_volumes and self.volumes_remove and not was_attached:
-                for vol_name in self.named_volumes.values():
-                    with contextlib.suppress(Exception):
-                        vol = await self._client.volumes.get(vol_name)
-                        await vol.delete()
-                logger.info("Removed %d named volume(s)", len(self.named_volumes))
-            await self._client.close()
-            self._client = None
-        self._tools = None
-
-    @property
-    def tools(self) -> list[Tool[Any]]:
-        """Return the axio Tool instances for this sandbox. Only valid inside `async with`."""
-        if self._tools is None:
-            raise RuntimeError("DockerSandbox must be used as an async context manager")
-        return list(self._tools)
+        )
 
     @property
     def container_id(self) -> str:
         """Return the ID of the running container. Only valid inside `async with`."""
-        if self._container is None:
+        if self.container is None:
             raise RuntimeError("DockerSandbox must be used as an async context manager")
-        return str(self._container.id)
+        return str(self.container.id)
 
-    async def _ensure_image(self) -> None:
+    async def ensure_running(self) -> None:
+        """Start the container if it exists but isn't running (e.g. a reused one
+        that was stopped). Idempotent — a no-op for a freshly-started container."""
+        if self.container is None:
+            return
+        info = await self.container.show()
+        if not info.get("State", {}).get("Running", False):
+            await self.container.start()
+
+    async def ensure_image(self) -> None:
         """Pull the image if it is not present locally."""
-        assert self._client is not None
+        assert self.client is not None
         try:
-            await self._client.images.inspect(self.image)
+            await self.client.images.inspect(self.image)
             logger.debug("Image already present: %s", self.image)
         except aiodocker.exceptions.DockerError:
             logger.info("Pulling image %s ...", self.image)
-            await self._client.images.pull(self.image)
+            await self.client.images.pull(self.image)
             logger.info("Image pulled: %s", self.image)
 
     async def exec(self, command: str, timeout: float = 30, stdin: str | None = None) -> str:
         """Execute a shell command inside the container and return its output."""
-        assert self._container is not None
+        assert self.container is not None
 
         if stdin is not None:
             stdin_path = f"/tmp/.axio_stdin_{uuid.uuid4().hex}"
@@ -483,7 +490,7 @@ class DockerSandbox:
             # uses semicolons (e.g. RunPython's "; exit $_rc" suffix).
             command = f"( {command} ) < {stdin_path}; _rc=$?; rm -f {stdin_path}; exit $_rc"
 
-        exec_obj = await self._container.exec(
+        exec_obj = await self.container.exec(
             cmd=["sh", "-c", command],
             stdout=True,
             stderr=True,
@@ -521,10 +528,9 @@ class DockerSandbox:
             output += f"\n[exit code: {exit_code}]"
         return output.strip() or "(no output)"
 
-    async def write_file(self, path: str, content: str, mode: int = 0o644) -> str:
-        """Write a string to a file inside the container."""
-        assert self._container is not None
-        data = content.encode()
+    async def write_bytes(self, path: str, data: bytes, mode: int = 0o644) -> str:
+        """Write raw bytes to a file inside the container. Parent dirs are created."""
+        assert self.container is not None
         buf = io.BytesIO()
         with tarfile.open(fileobj=buf, mode="w:") as tar:
             info = tarfile.TarInfo(name=os.path.basename(path))
@@ -533,17 +539,18 @@ class DockerSandbox:
             tar.addfile(info, io.BytesIO(data))
         parent = os.path.dirname(path) or "/"
         await self.exec(f"mkdir -p {shlex.quote(parent)}")
-        await self._container.put_archive(
-            path=parent,
-            data=buf.getvalue(),
-        )
+        await self.container.put_archive(path=parent, data=buf.getvalue())
         return f"Wrote {len(data)} bytes to {path}"
+
+    async def write_file(self, path: str, content: str, mode: int = 0o644) -> str:
+        """Write a string to a file inside the container."""
+        return await self.write_bytes(path, content.encode(), mode=mode)
 
     async def get_archive(self, path: str) -> tarfile.TarFile:
         """Fetch a path from the container as a TarFile object."""
-        assert self._container is not None
+        assert self.container is not None
         try:
-            return cast(tarfile.TarFile, await self._container.get_archive(path=path))
+            return cast(tarfile.TarFile, await self.container.get_archive(path=path))
         except aiodocker.exceptions.DockerError as exc:
             if exc.status == 404:
                 raise FileNotFoundError(f"No such file or directory: {path!r}") from exc

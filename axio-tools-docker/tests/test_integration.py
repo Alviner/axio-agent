@@ -91,6 +91,20 @@ async def test_write_file_mode(sandbox: DockerSandbox) -> None:
     assert "755" in result
 
 
+async def test_write_bytes(sandbox: DockerSandbox) -> None:
+    payload = bytes(range(256))
+    await sandbox.write_bytes("/workspace/blob.bin", payload, mode=0o600)
+    assert await sandbox.read_file_bytes("/workspace/blob.bin") == payload
+    assert "600" in await sandbox.exec("stat -c '%a' /workspace/blob.bin")
+
+
+async def test_ensure_running_restarts_stopped_container(sandbox: DockerSandbox) -> None:
+    assert sandbox.container is not None
+    await sandbox.container.stop()
+    await sandbox.ensure_running()  # must bring it back up
+    assert await sandbox.exec("echo alive") == "alive"
+
+
 async def test_read_file_line_range(sandbox: DockerSandbox) -> None:
     await sandbox.write_file("/workspace/lines.txt", "a\nb\nc\nd\ne\n")
     tool = next(t for t in sandbox.tools if t.name == "read_file")
