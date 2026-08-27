@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import importlib.util
 import json
 import logging
 import os
@@ -185,6 +186,34 @@ def _convert_tools(tools: list[Tool[Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _google_auth_available() -> bool:
+    """Return whether the Vertex AI credential dependencies are importable."""
+    try:
+        return all(importlib.util.find_spec(name) is not None for name in ("google.auth", "requests"))
+    except Exception:
+        # Partially installed namespace packages can make find_spec raise different exception types.
+        return False
+
+
+def _vertexai_from_env() -> bool:
+    """Resolve the backend from the environment.
+
+    ``ANTHROPIC_VERTEXAI`` is this transport's own switch, consistent with the
+    ``ANTHROPIC_API_KEY`` and ``ANTHROPIC_BASE_URL`` it already reads.
+
+    ``GOOGLE_GENAI_USE_VERTEXAI`` is honoured after it, for compatibility, but it
+    belongs to the Google Gen AI SDK: anything configuring *that* library for
+    Vertex AI silently redirects Claude traffic here too, which is surprising when
+    the two are unrelated. Set ``ANTHROPIC_VERTEXAI=false`` to opt this transport
+    out while leaving the Google variable in place.
+    """
+    for name in ("ANTHROPIC_VERTEXAI", "GOOGLE_GENAI_USE_VERTEXAI"):
+        value = os.environ.get(name, "").strip().lower()
+        if value:
+            return value in ("true", "1")
+    return False
+
+
 def _get_vertex_access_token() -> str:
     import google.auth
     import google.auth.transport.requests
@@ -216,10 +245,31 @@ class AnthropicTransport(CompletionTransport):
     retry_base_delay: float = 5.0
 
     def __post_init__(self) -> None:
+        # Capture whether the caller named a backend before None is replaced by
+        # the environment value; explicit and inherited requests fail differently.
+        explicit = self.vertexai is not None
         if isinstance(self.vertexai, str):
             self.vertexai = self.vertexai.lower() in ("true", "1")
         if self.vertexai is None:
-            self.vertexai = os.environ.get("GOOGLE_GENAI_USE_VERTEXAI", "").lower() in ("true", "1")
+            self.vertexai = _vertexai_from_env()
+        if self.vertexai and not _google_auth_available():
+            # An explicit request is intent, and silently serving it from a
+            # different backend would be worse than failing: with no api_key set
+            # it resurfaces as an opaque 401 from api.anthropic.com. Ambient
+            # configuration is a different case - it is a machine-wide default
+            # that should not break a transport which never touches Vertex AI -
+            # so that one degrades with a warning instead.
+            if explicit:
+                raise ImportError(
+                    "vertexai was requested explicitly, but google-auth[requests] is not "
+                    "installed. Install it, or leave vertexai unset to use the direct "
+                    "Anthropic API."
+                )
+            logger.warning(
+                "GOOGLE_GENAI_USE_VERTEXAI selects Vertex AI but google-auth[requests] is "
+                "not installed; falling back to the direct Anthropic API."
+            )
+            self.vertexai = False
 
     def _build_url(self) -> str:
         if self.vertexai:
