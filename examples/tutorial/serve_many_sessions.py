@@ -87,43 +87,62 @@ class CloudHarness:
         self._prototype_agent = prototype_agent
         self._context_factory = context_factory
         self._sandbox_factory = sandbox_factory
-        self._sessions: dict[str, CloudSession] = {}
+        self._sessions: dict[str, asyncio.Task[CloudSession]] = {}
         self._registry_lock = asyncio.Lock()
         self._closed = False
 
     # [docs:start-serve-session-create]
+    @staticmethod
+    def _failed(opening: asyncio.Task[CloudSession]) -> bool:
+        """Whether this open finished without producing a session, which is when to forget it.
+
+        Cancelled counts. Kept, a cancelled open hands `CancelledError` to every later turn for
+        that ID for the life of the harness.
+        """
+        if not opening.done():
+            return False
+        return opening.cancelled() or opening.exception() is not None
+
     async def _session(self, session_id: str) -> CloudSession:
         async with self._registry_lock:
             if self._closed:
                 raise RuntimeError("harness is closed")
 
-            existing = self._sessions.get(session_id)
-            if existing is not None:
-                return existing
+            opening = self._sessions.get(session_id)
+            if opening is not None and self._failed(opening):
+                # A session that would not open is not a session. Kept, its failure is handed to
+                # every later turn for that ID; dropped here, the next request tries again.
+                opening = None
+            if opening is None:
+                opening = asyncio.create_task(self._open(session_id))
+                self._sessions[session_id] = opening
 
-            resources = AsyncExitStack()
-            try:
-                context = self._context_factory(session_id)
-                resources.push_async_callback(context.close)
-                sandbox = await resources.enter_async_context(
-                    self._sandbox_factory(session_id)
-                )
-                session = CloudSession(
-                    agent=self._prototype_agent.copy(
-                        tools=[
-                            *self._prototype_agent.tools,
-                            *(bound_text_tool(tool) for tool in sandbox.tools),
-                        ],
-                    ),
-                    context=context,
-                    resources=resources,
-                )
-            except BaseException:
-                await resources.aclose()
-                raise
+        # Started under the lock and awaited outside it: held while the container starts, one
+        # cold session made every other first turn wait. `shield` keeps the open running when
+        # this caller gives up, because it is already creating a container.
+        return await asyncio.shield(opening)
 
-            self._sessions[session_id] = session
-            return session
+    async def _open(self, session_id: str) -> CloudSession:
+        resources = AsyncExitStack()
+        try:
+            context = self._context_factory(session_id)
+            resources.push_async_callback(context.close)
+            sandbox = await resources.enter_async_context(
+                self._sandbox_factory(session_id)
+            )
+            return CloudSession(
+                agent=self._prototype_agent.copy(
+                    tools=[
+                        *self._prototype_agent.tools,
+                        *(bound_text_tool(tool) for tool in sandbox.tools),
+                    ],
+                ),
+                context=context,
+                resources=resources,
+            )
+        except BaseException:
+            await resources.aclose()
+            raise
 
     # [docs:end-serve-session-create]
 
@@ -145,10 +164,19 @@ class CloudHarness:
     async def close(self) -> None:
         async with self._registry_lock:
             self._closed = True
-            sessions = list(self._sessions.values())
+            opening = list(self._sessions.values())
             self._sessions.clear()
 
-        await asyncio.gather(*(session.resources.aclose() for session in sessions))
+        # A session still opening owns a container already. Wait for it before closing, or the
+        # resources it is in the middle of taking outlive the harness that asked for them.
+        opened = await asyncio.gather(*opening, return_exceptions=True)
+        await asyncio.gather(
+            *(
+                session.resources.aclose()
+                for session in opened
+                if isinstance(session, CloudSession)
+            )
+        )
 
     # [docs:end-serve-turn-lifecycle]
 
@@ -402,8 +430,10 @@ async def verify_registry() -> None:
     assert contexts["alice"] is not contexts["bob"]
     assert sandboxes["alice"] is not sandboxes["bob"]
 
-    alice_session = harness._sessions["alice"]
-    bob_session = harness._sessions["bob"]
+    # The registry holds the task that opens a session, so a cold turn does not wait behind
+    # another session's container start.
+    alice_session = await harness._sessions["alice"]
+    bob_session = await harness._sessions["bob"]
     assert alice_session is not bob_session
     assert alice_session.agent is not bob_session.agent
     assert [tool.name for tool in alice_session.agent.tools] == [
